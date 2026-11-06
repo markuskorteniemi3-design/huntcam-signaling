@@ -1,12 +1,10 @@
 {
   "name": "huntcam-signaling",
-  "version": "1.0.0",
-  "description": "WebRTC signaling server for HuntCam AI",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Authenticated HuntCam signaling and detection storage",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
-  }
+  "engines": {"node": "22.x"},
+  "scripts": {"start": "node server.js", "test": "node --test ../tests/*.test.js"},
+  "dependencies": {"firebase-admin": "14.5.0", "ws": "^8.18.3"}
 }
