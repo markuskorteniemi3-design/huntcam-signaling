@@ -5,7 +5,7 @@ const {pipeline} = require('stream/promises');
 const {Transform} = require('stream');
 const WebSocket = require('ws');
 const {initializeApp, applicationDefault} = require('firebase-admin/app');
-const {getFirestore, Timestamp, GeoPoint} = require('firebase-admin/firestore');
+const {getFirestore, Timestamp, GeoPoint, FieldValue} = require('firebase-admin/firestore');
 const {getStorage} = require('firebase-admin/storage');
 const {getAuth} = require('firebase-admin/auth');
 const {deviceRegistry, authenticateDevice, observationId, normalizeDetection} = require('./core');
@@ -24,14 +24,51 @@ function deviceForRequest(req) {
   const token = (req.headers.authorization || '').replace(/^Bearer /,'');
   return authenticateDevice(devices, req.headers['x-huntcam-device'], token);
 }
+const videoKinds = ['video', 'video_long', 'video_3m'];
+const videoTtlMs = 5 * 24 * 60 * 60 * 1000;
+const videoExpired = data => data.video_state === 'expired' ||
+  (data.video_expires_at?.toMillis?.() ?? Infinity) <= Date.now();
+let sweepingVideos = false;
+
+async function sweepExpiredVideos() {
+  if (sweepingVideos) return;
+  sweepingVideos = true;
+  try {
+    const expired = await db.collection('detections')
+      .where('video_expires_at', '<=', Timestamp.now()).limit(100).get();
+    for (const doc of expired.docs) {
+      try {
+        const data = doc.data();
+        const prefix = `detections/${data.owner_uid}/${data.device_id}/${doc.id}/`;
+        const updates = {video_expires_at:FieldValue.delete()};
+        for (const kind of videoKinds) {
+          try { await bucket.file(prefix + kind + '.mp4').delete(); }
+          catch (error) { if (Number(error.code) !== 404) throw error; }
+          updates[kind + '_url'] = '';
+          updates[kind + '_storage_path'] = '';
+          updates[kind + '_state'] = 'expired';
+        }
+        await doc.ref.update(updates);
+      } catch (error) {
+        console.error('Video expiry retry:', error.code || error.name);
+      }
+    }
+  } catch (error) {
+    console.error('Video expiry sweep failed:', error.code || error.name);
+  } finally {
+    sweepingVideos = false;
+  }
+}
+
 async function upload(req, ref, kind, d, id) {
   const snapshot = await ref.get();
   if (!snapshot.exists || snapshot.data().device_id!==d.device_id || snapshot.data().owner_uid!==d.owner_uid) return 404;
-  const max = kind==='image' ? 3*1024*1024 : 25*1024*1024;
+  if (kind !== 'image' && videoExpired(snapshot.data())) return 410;
+  const max = (kind==='image' ? 3 : kind==='video_3m' ? 50 : 25)*1024*1024;
   const length = Number(req.headers['content-length']);
   const type = kind==='image' ? 'image/jpeg' : 'video/mp4';
   if (!Number.isSafeInteger(length) || length<12 || length>max || req.headers['content-type']!==type) return 400;
-  const path = `detections/${d.owner_uid}/${d.device_id}/${id}/${kind==='image'?'image.jpg':'video.mp4'}`;
+  const path = `detections/${d.owner_uid}/${d.device_id}/${id}/${kind==='image'?'image.jpg':kind+'.mp4'}`;
   const file=bucket.file(path);
   // A retry after a committed upload must reuse its download token.
   let metadata;
@@ -58,10 +95,16 @@ async function upload(req, ref, kind, d, id) {
     } catch(e) { if(Number(e.code)!==412) throw e; }
     [metadata]=await file.getMetadata();
   } else { req.resume(); }
+  if (kind !== 'image' && videoExpired((await ref.get()).data())) {
+    try { await file.delete(); }
+    catch (error) { if (Number(error.code) !== 404) throw error; }
+    return 410;
+  }
   const token=metadata.metadata?.firebaseStorageDownloadTokens;
   if(!token) throw new Error('Media download token missing');
   const url=`https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(path)}?alt=media&token=${encodeURIComponent(token.split(',')[0])}`;
-  await ref.update({[kind+'_url']:url, [kind+'_storage_path']:path, updated_at:Timestamp.now()});
+  await ref.update({[kind+'_url']:url, [kind+'_storage_path']:path, updated_at:Timestamp.now(),
+    ...(['video_long','video_3m'].includes(kind) ? {[kind+'_state']:'uploaded'} : {})});
   return 200;
 }
 const server=http.createServer(async(req,res)=>{
@@ -70,6 +113,37 @@ const server=http.createServer(async(req,res)=>{
     const path=new URL(req.url,'http://localhost').pathname;
     if(path==='/health') return json(res,200,{status:'ok',version:'huntcam-storage-1'});
     if(!path.startsWith('/api/detections')) return json(res,404,{error:'Not found'});
+    const longVideo = path.match(/^\/api\/detections\/([a-f0-9]{64})\/video-(long|3m)$/);
+    const longKind = longVideo && 'video_' + longVideo[2];
+    if (longVideo && (req.method === 'OPTIONS' || req.method === 'POST') &&
+        !req.headers['x-huntcam-device']) {
+      const origin = req.headers.origin;
+      const origins = (process.env.HUNTCAM_APP_ORIGINS || 'https://tm-prod.dreamflow.cloud').split(',');
+      if (origin && origins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Authorization');
+      }
+      if (req.method === 'OPTIONS') return json(res, 204, {});
+      let uid;
+      try {
+        const bearer = (req.headers.authorization || '').replace(/^Bearer /, '');
+        ({uid} = await getAuth().verifyIdToken(bearer));
+      } catch {
+        return json(res, 401, {error:'Unauthorized'});
+      }
+      const ref = db.collection('detections').doc(longVideo[1]);
+      const snapshot = await ref.get();
+      if (!snapshot.exists || snapshot.data().owner_uid !== uid)
+        return json(res, 404, {error:'Not found'});
+      if (videoExpired(snapshot.data())) return json(res, 200, {state:'expired', url:''});
+      const state = snapshot.data()[longKind+'_state'] || 'unavailable';
+      if (state === 'recording' || state === 'ready') {
+        await ref.update({[longKind+'_requested']:true});
+      }
+      return json(res, 200, {state, url:snapshot.data()[longKind+'_url'] || ''});
+    }
     const d=deviceForRequest(req);
     if(!d) {req.resume(); return json(res,401,{error:'Unauthorized'});}
     if(req.method==='POST' && path==='/api/detections') {
@@ -77,11 +151,39 @@ const server=http.createServer(async(req,res)=>{
       const doc={owner_uid:d.owner_uid,device_id:d.device_id,dog_name:d.dog_name,
         event_id:data.event_id,animal_type:n.animal_type,confidence:n.confidence,
         detected_at:Timestamp.fromMillis(n.timestamp*1000),created_at:Timestamp.now(),
-        image_url:'',video_url:'',source:'CM5_V17'};
+        video_expires_at:Timestamp.fromMillis(n.timestamp*1000 + videoTtlMs),
+        image_url:'',video_url:'',source:'CM5_V17',
+        ...(data.long_video_available === true
+          ? {video_long_state:'recording', video_long_requested:false, video_long_url:'', video_3m_state:'recording', video_3m_requested:false, video_3m_url:''}
+          : {})};
       if(n.location) doc.location=new GeoPoint(...n.location);
       try {await db.collection('detections').doc(id).create(doc);}
       catch(e) {if(Number(e.code)!==6 && e.code!=='already-exists') throw e;}
       return json(res,200,{id});
+    }
+    if (longVideo) {
+      const ref = db.collection('detections').doc(longVideo[1]);
+      const snapshot = await ref.get();
+      if (!snapshot.exists || snapshot.data().device_id !== d.device_id ||
+          snapshot.data().owner_uid !== d.owner_uid)
+        return json(res, 404, {error:'Not found'});
+      const data = snapshot.data();
+      const state = data[longKind+'_state'] || 'unavailable';
+      if (req.method === 'GET')
+        return json(res, 200, {state, requested:data[longKind+'_requested'] === true});
+      if (req.method === 'POST') {
+        const update = await readJson(req);
+        if (!['ready', 'expired', 'unavailable'].includes(update.state))
+          return json(res, 400, {error:'Invalid state'});
+        if (state !== 'uploaded' && (update.state !== 'ready' || state === 'recording'))
+          await ref.update({[longKind+'_state']:update.state});
+        return json(res, 200, {ok:true});
+      }
+      if (req.method === 'PUT' && data[longKind+'_requested'] === true &&
+          ['recording', 'ready', 'uploaded'].includes(state)) {
+        const status = await upload(req, ref, longKind, d, longVideo[1]);
+        return json(res, status, {ok:status === 200});
+      }
     }
     const match=path.match(/^\/api\/detections\/([a-f0-9]{64})\/(image|video)$/);
     if(req.method==='PUT' && match) {
@@ -152,6 +254,8 @@ wss.on('connection',ws=>{
     if(ws.role==='video') for(const viewer of group(ws.device,'viewer')) send(viewer,{type:'video_offline'});
   });
 });
+const videoSweep = setInterval(sweepExpiredVideos, 5 * 60 * 1000);
+server.on('close', () => clearInterval(videoSweep));
 const heartbeat=setInterval(()=>{for(const ws of wss.clients){if(!ws.isAlive) ws.terminate(); else {ws.isAlive=false;ws.ping();}}},30000);
 wss.on('close',()=>clearInterval(heartbeat));
 server.listen(process.env.PORT || 10000,'0.0.0.0',()=>console.log('HuntCam authenticated server ready'));
