@@ -254,8 +254,10 @@ wss.on('connection',ws=>{
     if(ws.role==='video') for(const viewer of group(ws.device,'viewer')) send(viewer,{type:'video_offline'});
   });
 });
-const videoSweep = setInterval(sweepExpiredVideos, 5 * 60 * 1000);
-server.on('close', () => clearInterval(videoSweep));
+if (process.env.HUNTCAM_DISABLE_VIDEO_SWEEP !== '1') {
+  const videoSweep = setInterval(sweepExpiredVideos, 5 * 60 * 1000);
+  server.on('close', () => clearInterval(videoSweep));
+}
 const heartbeat=setInterval(()=>{for(const ws of wss.clients){if(!ws.isAlive) ws.terminate(); else {ws.isAlive=false;ws.ping();}}},30000);
 wss.on('close',()=>clearInterval(heartbeat));
 server.listen(process.env.PORT || 10000,'0.0.0.0',()=>console.log('HuntCam authenticated server ready'));
