@@ -12,6 +12,11 @@ const {deviceRegistry, authenticateDevice, observationId, normalizeDetection} = 
 const devices = deviceRegistry(process.env); // Fail closed: no unconfigured device connections.
 const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
 if (!bucketName) throw new Error('FIREBASE_STORAGE_BUCKET missing');
+const credentialPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+console.info('Firebase credential file check', {
+  pathMatches: credentialPath === '/etc/secrets/firebase-test.json',
+  fileExists: Boolean(credentialPath && require('node:fs').existsSync(credentialPath)),
+});
 initializeApp({credential:applicationDefault(), storageBucket:bucketName});
 const db = getFirestore(), bucket = getStorage().bucket();
 const json = (res, status, body) => {res.writeHead(status, {'Content-Type':'application/json', 'Cache-Control':'no-store'}); res.end(JSON.stringify(body));};
