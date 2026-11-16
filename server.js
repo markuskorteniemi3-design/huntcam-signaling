@@ -244,8 +244,10 @@ wss.on('connection',ws=>{
       }else if(ws.role==='video' && (data.type==='offer' || data.type==='candidate')) {
         const viewer=group(d,'viewer').find(c=>c.sessionId===data.session_id);
         if(viewer) send(viewer,data);
-      }
-    }catch(e){ws.close(1008,'Authentication or message rejected');}
+      }} catch (err) {
+  console.warn('HuntCam WebSocket rejected:', err?.code ?? err?.message ?? 'unknown');
+  ws.close(1008, 'Authentication or message rejected');
+}
     finally {busy=false;}
   });
   ws.on('close',()=>{
