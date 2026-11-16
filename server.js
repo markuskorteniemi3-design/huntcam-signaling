@@ -16,6 +16,9 @@ const credentialPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
 console.info('Firebase credential file check', {
   pathMatches: credentialPath === '/etc/secrets/firebase-test.json',
   fileExists: Boolean(credentialPath && require('node:fs').existsSync(credentialPath)),
+    fileBesideServer: require('node:fs').existsSync(
+    require('node:path').join(__dirname, 'firebase-test.json')
+  ),
 });
 initializeApp({credential:applicationDefault(), storageBucket:bucketName});
 const db = getFirestore(), bucket = getStorage().bucket();
