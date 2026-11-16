@@ -245,7 +245,10 @@ wss.on('connection',ws=>{
         const viewer=group(d,'viewer').find(c=>c.sessionId===data.session_id);
         if(viewer) send(viewer,data);
       }} catch (err) {
-  console.warn('HuntCam WebSocket rejected:', err?.code ?? err?.message ?? 'unknown');
+ const reason = String(err?.message ?? '').match(
+  /ENOENT|EACCES|invalid_grant|invalid_client|invalid_scope|Invalid JWT Signature|ENOTFOUND|ETIMEDOUT|ECONNRESET/i
+)?.[0] ?? 'unclassified';
+console.warn('HuntCam WebSocket rejected:', err?.code ?? 'unknown', reason);
   ws.close(1008, 'Authentication or message rejected');
 }
     finally {busy=false;}
