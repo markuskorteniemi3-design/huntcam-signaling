@@ -201,6 +201,41 @@ const wss=new WebSocket.Server({server,maxPayload:256*1024,perMessageDeflate:fal
 const send=(ws,data)=>{if(ws.readyState===WebSocket.OPEN && ws.bufferedAmount<1024*1024) ws.send(JSON.stringify(data));};
 function group(d,role) {return [...wss.clients].filter(c=>c.device?.device_id===d.device_id && c.role===role);}
 function announceViewer(viewer) {for(const video of group(viewer.device,'video')) send(video,{type:'viewer_ready',session_id:viewer.sessionId});}
+
+// Live bark telemetry is validated independently of GPS and animal detections.
+function normalizeBarkStatus(data) {
+  const available = data.audio_available;
+  const count = data.barks_per_minute;
+  const age = data.state_age_ms;
+  if (typeof available !== 'boolean' || typeof data.barking !== 'boolean' ||
+      !Number.isFinite(age) || age < 0 || age > 4000 ||
+      !Number.isSafeInteger(data.timestamp) || data.timestamp < 0 ||
+      (available && (!Number.isSafeInteger(count) || count < 0 || count > 1000)) ||
+      (!available && (count !== null || data.barking !== false))) {
+    throw new Error('Invalid bark status');
+  }
+  const observed = data.observed_seconds ?? 0;
+  if (!Number.isFinite(observed) || observed < 0 || observed > 60 ||
+      typeof data.complete_window !== 'boolean') throw new Error('Invalid bark window');
+  const last = data.last_bark_timestamp ?? null;
+  if (last !== null && (!Number.isFinite(last) || last < 0 || last > data.timestamp + 1))
+    throw new Error('Invalid bark timestamp');
+  return {
+    type: 'bark_status', source: 'CM5_BARK', timestamp: data.timestamp,
+    audio_available: available, barking: available && data.barking,
+    barks_per_minute: available ? count : null, state_age_ms: age,
+    observed_seconds: observed, complete_window: available && data.complete_window,
+    last_bark_timestamp: last, experimental: true,
+  };
+}
+
+// A telemetry subscriber has the same owner/device check as a live viewer,
+// but does not open a video session. This also supports the map page later.
+function sensorSubscribers(device) {
+  return [...wss.clients].filter(client =>
+    client.device?.device_id === device.device_id &&
+    (client.role === 'viewer' || client.role === 'telemetry'));
+}
 wss.on('connection',ws=>{
   ws.isAlive=true; ws.on('pong',()=>ws.isAlive=true);
   const timeout=setTimeout(()=>ws.close(1008,'Authentication required'),10000);
@@ -213,11 +248,11 @@ wss.on('connection',ws=>{
       const data=JSON.parse(raw.toString());
       if(!ws.device) {
         if(data.type!=='auth') throw new Error('auth');
-        if(data.role==='viewer') {
+        if(data.role==='viewer' || data.role==='telemetry') {
           const claims=await getAuth().verifyIdToken(data.id_token,true);
           const d=devices.get(data.device_id);
           if(!d || claims.uid!==d.owner_uid) throw new Error('access');
-          ws.device=d; ws.role='viewer'; ws.sessionId=crypto.randomUUID();
+          ws.device=d; ws.role=data.role; ws.sessionId=crypto.randomUUID();
           expires=setTimeout(()=>ws.close(1008,'Refresh authentication'),Math.max(1,claims.exp*1000-Date.now()));
         } else if(data.role==='sensor' || data.role==='video') {
           const d=authenticateDevice(devices,data.device_id,data.token);
@@ -232,12 +267,15 @@ wss.on('connection',ws=>{
       }
       const d=ws.device;
       if(ws.role==='sensor') {
+        let outgoing = data;
         if(data.type==='detection') normalizeDetection(data);
         else if(data.type==='location') {
           if(typeof data.latitude!=='number' || typeof data.longitude!=='number' || !Number.isFinite(data.latitude) || !Number.isFinite(data.longitude) || Math.abs(data.latitude)>90 || Math.abs(data.longitude)>180) throw new Error('gps');
-        }else return;
+        } else if(data.type==='bark_status') {
+          outgoing = {...normalizeBarkStatus(data), device_id:d.device_id};
+        } else return;
         // Persistence goes through authenticated HTTP API and durable CM5 outbox.
-        for(const viewer of group(d,'viewer')) send(viewer,data);
+        for(const viewer of sensorSubscribers(d)) send(viewer,outgoing);
       }else if(ws.role==='viewer') {
         if(data.type==='settings') for(const sensor of group(d,'sensor')) send(sensor,data);
         else if(data.type==='answer' || data.type==='candidate') for(const video of group(d,'video')) send(video,{...data,session_id:ws.sessionId});
